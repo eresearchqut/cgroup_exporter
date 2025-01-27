@@ -73,6 +73,12 @@ func getInfov1(name string, metric *CgroupMetric, logger log.Logger) {
 		metric.jobid = pathBaseSplit[0]
 		return
 	}
+	if strings.HasPrefix(name, "/pbs_jobs") {
+		metric.job = true
+		pathBaseSplit := strings.Split(pathBase, ".")
+		metric.jobid = pathBaseSplit[0]
+		return
+	}
 }
 
 func getNamev1(p cgroup1.Process, logger log.Logger) (string, error) {
