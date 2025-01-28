@@ -15,11 +15,15 @@ package collector
 
 import (
 	"fmt"
+	"os"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/go-kit/log"
@@ -36,6 +40,35 @@ func subsystem() ([]cgroup1.Subsystem, error) {
 		cgroup1.NewMemory(*CgroupRoot),
 	}
 	return s, nil
+}
+
+func getPbsInfo(jobid string, metric *CgroupMetric, logger log.Logger) {
+	pbsHome := "/var/spool/PBS/"
+	filename := filepath.Join(pbsHome, "mom_priv", "jobs", jobid+".SC")
+
+	// submission script will only exist on primary node in multi-node jobs
+	fileInfo, err := os.Stat(filename)
+	if err != nil {
+		level.Debug(logger).Log("msg", "Error statting file", "filename", filename, "err", err)
+		return
+	}
+
+	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		level.Error(logger).Log("msg", "Not a syscall.Stat_t", "filename", filename, "ok", ok)
+		return
+	}
+
+	uid := stat.Uid
+	user, err := user.LookupId(strconv.Itoa(int(uid)))
+	if err != nil {
+		level.Error(logger).Log("msg", "Unable to lookup user", "user", user, "err", err)
+		return
+	}
+
+	metric.uid = user.Uid
+	metric.username = user.Username
+	level.Debug(logger).Log("msg", "Job owner", "job", jobid, "owner", metric.username)
 }
 
 func getInfov1(name string, metric *CgroupMetric, logger log.Logger) {
@@ -77,39 +110,15 @@ func getInfov1(name string, metric *CgroupMetric, logger log.Logger) {
 		metric.job = true
 		pathBaseSplit := strings.Split(pathBase, ".")
 		metric.jobid = pathBaseSplit[0]
+		getPbsInfo(pathBase, metric, logger)
 		return
 	}
 }
 
-func getNamev1(p cgroup1.Process, logger log.Logger) (string, error) {
-	cpuacctPath := filepath.Join(*CgroupRoot, "cpuacct")
-	name := strings.TrimPrefix(p.Path, cpuacctPath)
-	name = strings.TrimSuffix(name, "/")
-	dirs := strings.Split(name, "/")
-	level.Debug(logger).Log("msg", "cgroup name", "dirs", fmt.Sprintf("%v", dirs))
-	// Handle user.slice, system.slice and torque
-	if len(dirs) == 3 {
-		return name, nil
-	}
-	// Handle deeper cgroup where we want higher level, mainly SLURM
-	var keepDirs []string
-	for i, d := range dirs {
-		if strings.HasPrefix(d, "job_") {
-			keepDirs = dirs[0 : i+1]
-			break
-		}
-	}
-	if keepDirs == nil {
-		return name, nil
-	}
-	name = strings.Join(keepDirs, "/")
-	return name, nil
-}
-
-func (e *Exporter) getMetricsv1(name string, pids map[string][]int) (CgroupMetric, error) {
+func (e *Exporter) getMetricsv1(name string) (CgroupMetric, error) {
 	metric := CgroupMetric{name: name}
 	level.Debug(e.logger).Log("msg", "Loading cgroup", "root", *CgroupRoot, "path", name)
-	ctrl, err := cgroup1.Load(cgroup1.StaticPath(name), cgroup1.WithHiearchy(subsystem))
+	ctrl, err := cgroup1.Load(cgroup1.StaticPath(name))
 	if err != nil {
 		level.Error(e.logger).Log("msg", "Failed to load cgroups", "path", name, "err", err)
 		metric.err = true
@@ -152,11 +161,16 @@ func (e *Exporter) getMetricsv1(name string, pids map[string][]int) (CgroupMetri
 		metric.cpus = len(cpus)
 		metric.cpu_list = strings.Join(cpus, ",")
 	}
+	procs, _ := ctrl.Processes(cgroup1.Devices, true)
+	pids := make([]int, len(procs))
+	for i, p := range procs {
+		pids[i] = p.Pid
+	}
 	getInfov1(name, &metric, e.logger)
 	if *collectProc {
-		if val, ok := pids[name]; ok {
-			level.Debug(e.logger).Log("msg", "Get process info", "pids", fmt.Sprintf("%v", val))
-			getProcInfo(val, &metric, e.logger)
+		if len(pids) > 0 {
+			level.Debug(e.logger).Log("msg", "Get process info", "pids", fmt.Sprintf("%v", pids))
+			getProcInfo(pids, &metric, e.logger)
 		} else {
 			level.Error(e.logger).Log("msg", "Unable to get PIDs", "path", name)
 			metric.err = true
@@ -165,8 +179,62 @@ func (e *Exporter) getMetricsv1(name string, pids map[string][]int) (CgroupMetri
 	return metric, nil
 }
 
+func listCgroupsV1(root string, subsystems []string, name string, logger log.Logger) ([]string, error) {
+	var cgroups []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				level.Error(logger).Log("msg", "Permission error accessing", "file", path, "err", err)
+				return filepath.SkipDir
+			}
+
+			level.Error(logger).Log("msg", "Error accessing", "file", path, "err", err)
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+
+		relPath := strings.TrimPrefix(path, root)
+		subsystem, cgroupName, found := strings.Cut(strings.TrimPrefix(relPath, "/"), "/")
+		cgroupName = "/" + cgroupName
+
+		if subsystem != "" {
+			// filter on subsystems used by parent cgroup
+			if !slices.Contains(subsystems, subsystem) {
+				return filepath.SkipDir
+			}
+			// filter on cgroup path
+			if !strings.HasPrefix(cgroupName, name) {
+				return nil
+			}
+			// only include children of the search path
+			if cgroupName == name {
+				return nil
+			}
+			// cgroup already in list
+			if slices.Contains(cgroups, cgroupName) {
+				return nil
+			}
+		}
+
+		if found {
+			cgroupPath := strings.TrimPrefix(relPath, "/"+subsystem)
+			_, err := cgroup1.Load(cgroup1.StaticPath(cgroupPath))
+			if err == nil {
+				cgroups = append(cgroups, cgroupPath)
+			} else {
+				fmt.Println(err)
+			}
+		}
+
+		return nil
+	})
+
+	return cgroups, err
+}
+
 func (e *Exporter) collectv1() ([]CgroupMetric, error) {
-	var names []string
 	var metrics []CgroupMetric
 	for _, path := range e.paths {
 		level.Debug(e.logger).Log("msg", "Loading cgroup", "root", *CgroupRoot, "path", path)
@@ -177,44 +245,22 @@ func (e *Exporter) collectv1() ([]CgroupMetric, error) {
 			metrics = append(metrics, metric)
 			continue
 		}
-		processes, err := control.Processes(cgroup1.Cpuacct, true)
-		if err != nil {
-			level.Error(e.logger).Log("msg", "Error loading cgroup processes", "path", path, "err", err)
-			metric := CgroupMetric{name: path, err: true}
-			metrics = append(metrics, metric)
-			continue
+		subsystems := control.Subsystems()
+		subsystemNames := make([]string, len(subsystems))
+		for i, s := range subsystems {
+			subsystemNames[i] = string(s.Name())
 		}
-		level.Debug(e.logger).Log("msg", "Found processes", "processes", len(processes))
-		pids := make(map[string][]int)
-		for _, p := range processes {
-			level.Debug(e.logger).Log("msg", "Get Name", "process", p.Path, "pid", p.Pid, "path", path)
-			name, err := getNamev1(p, e.logger)
-			if err != nil {
-				level.Error(e.logger).Log("msg", "Error getting cgroup name for process", "process", p.Path, "path", path, "err", err)
-				continue
-			}
-			if !sliceContains(names, name) {
-				names = append(names, name)
-			}
-			if val, ok := pids[name]; ok {
-				if !sliceContains(val, p.Pid) {
-					val = append(val, p.Pid)
-				}
-				pids[name] = val
-			} else {
-				pids[name] = []int{p.Pid}
-			}
-		}
+		cgroupNames, _ := listCgroupsV1(*CgroupRoot, subsystemNames, path, e.logger)
 		wg := &sync.WaitGroup{}
-		wg.Add(len(names))
-		for _, name := range names {
-			go func(n string, p map[string][]int) {
+		wg.Add(len(cgroupNames))
+		for _, name := range cgroupNames {
+			go func(n string) {
 				defer wg.Done()
-				metric, _ := e.getMetricsv1(n, p)
+				metric, _ := e.getMetricsv1(n)
 				metricLock.Lock()
 				metrics = append(metrics, metric)
 				metricLock.Unlock()
-			}(name, pids)
+			}(name)
 		}
 		wg.Wait()
 	}
