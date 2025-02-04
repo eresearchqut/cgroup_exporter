@@ -66,6 +66,7 @@ type Exporter struct {
 	memswFailCount  *prometheus.Desc
 	info            *prometheus.Desc
 	processExec     *prometheus.Desc
+	processCount    *prometheus.Desc
 	logger          log.Logger
 	cgroupv2        bool
 }
@@ -91,6 +92,7 @@ type CgroupMetric struct {
 	username        string
 	jobid           string
 	processExec     map[string]float64
+	processCount    float64
 	err             bool
 }
 
@@ -137,6 +139,8 @@ func NewExporter(paths []string, logger log.Logger, cgroupv2 bool) *Exporter {
 			"User slice information", []string{"cgroup", "username", "uid", "jobid"}, nil),
 		processExec: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_exec_count"),
 			"Count of instances of a given process", []string{"cgroup", "exec"}, nil),
+		processCount: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_count"),
+			"Count of processes running in cgroup", []string{"cgroup"}, nil),
 		collectError: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "exporter", "collect_error"),
 			"Indicates collection error, 0=no error, 1=error", []string{"cgroup"}, nil),
 		logger:   logger,
@@ -195,6 +199,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		if m.userslice || m.job {
 			ch <- prometheus.MustNewConstMetric(e.info, prometheus.GaugeValue, 1, m.name, m.username, m.uid, m.jobid)
 		}
+		ch <- prometheus.MustNewConstMetric(e.processCount, prometheus.GaugeValue, m.processCount, m.name)
 		if *collectProc {
 			for exec, count := range m.processExec {
 				ch <- prometheus.MustNewConstMetric(e.processExec, prometheus.GaugeValue, count, m.name, exec)

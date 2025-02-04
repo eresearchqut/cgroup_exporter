@@ -163,6 +163,7 @@ func (e *Exporter) getMetricsv1(name string) (CgroupMetric, error) {
 	}
 	procs, _ := ctrl.Processes(cgroup1.Devices, true)
 	pids := make([]int, len(procs))
+	metric.processCount = float64(len(procs))
 	for i, p := range procs {
 		pids[i] = p.Pid
 	}
