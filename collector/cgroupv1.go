@@ -163,11 +163,11 @@ func (e *Exporter) getMetricsv1(name string) (CgroupMetric, error) {
 	}
 	procs, _ := ctrl.Processes(cgroup1.Devices, true)
 	pids := make([]int, len(procs))
-	metric.processCount = float64(len(procs))
 	for i, p := range procs {
 		pids[i] = p.Pid
 	}
 	getInfov1(name, &metric, e.logger)
+	getProcStats(pids, &metric, e.logger)
 	if *collectProc {
 		if len(pids) > 0 {
 			level.Debug(e.logger).Log("msg", "Get process info", "pids", fmt.Sprintf("%v", pids))

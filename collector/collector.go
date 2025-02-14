@@ -16,6 +16,7 @@ package collector
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"reflect"
 	"strconv"
 	"strings"
@@ -67,6 +68,9 @@ type Exporter struct {
 	info            *prometheus.Desc
 	processExec     *prometheus.Desc
 	processCount    *prometheus.Desc
+	threadCount     *prometheus.Desc
+	ioRead          *prometheus.Desc
+	ioWrite         *prometheus.Desc
 	logger          log.Logger
 	cgroupv2        bool
 }
@@ -93,6 +97,9 @@ type CgroupMetric struct {
 	jobid           string
 	processExec     map[string]float64
 	processCount    float64
+	threadCount     float64
+	ioRead          float64
+	ioWrite         float64
 	err             bool
 }
 
@@ -141,6 +148,12 @@ func NewExporter(paths []string, logger log.Logger, cgroupv2 bool) *Exporter {
 			"Count of instances of a given process", []string{"cgroup", "exec", "jobid"}, nil),
 		processCount: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_count"),
 			"Count of processes running in cgroup", []string{"cgroup", "jobid"}, nil),
+		threadCount: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "thread_count"),
+			"Count of processes threads in cgroup", []string{"cgroup", "jobid"}, nil),
+		ioRead: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "io", "read"),
+			"Total IO read in bytes", []string{"cgroup", "jobid"}, nil),
+		ioWrite: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "io", "write"),
+			"Total IO write in bytes", []string{"cgroup", "jobid"}, nil),
 		collectError: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "exporter", "collect_error"),
 			"Indicates collection error, 0=no error, 1=error", []string{"cgroup", "jobid"}, nil),
 		logger:   logger,
@@ -163,6 +176,10 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.memswTotal
 	ch <- e.memswFailCount
 	ch <- e.info
+	ch <- e.processCount
+	ch <- e.threadCount
+	ch <- e.ioRead
+	ch <- e.ioWrite
 	if *collectProc {
 		ch <- e.processExec
 	}
@@ -192,6 +209,10 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(e.memoryFailCount, prometheus.GaugeValue, m.memoryFailCount, m.name, m.jobid)
 		ch <- prometheus.MustNewConstMetric(e.memswUsed, prometheus.GaugeValue, m.memswUsed, m.name, m.jobid)
 		ch <- prometheus.MustNewConstMetric(e.memswTotal, prometheus.GaugeValue, m.memswTotal, m.name, m.jobid)
+		ch <- prometheus.MustNewConstMetric(e.processCount, prometheus.GaugeValue, m.processCount, m.name, m.jobid)
+		ch <- prometheus.MustNewConstMetric(e.threadCount, prometheus.GaugeValue, m.threadCount, m.name, m.jobid)
+		ch <- prometheus.MustNewConstMetric(e.ioRead, prometheus.GaugeValue, m.ioRead, m.name, m.jobid)
+		ch <- prometheus.MustNewConstMetric(e.ioWrite, prometheus.GaugeValue, m.ioWrite, m.name, m.jobid)
 		// These metrics currently have no cgroup v2 information
 		if !e.cgroupv2 {
 			ch <- prometheus.MustNewConstMetric(e.memswFailCount, prometheus.GaugeValue, m.memswFailCount, m.name, m.jobid)
@@ -199,11 +220,64 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		if m.userslice || m.job {
 			ch <- prometheus.MustNewConstMetric(e.info, prometheus.GaugeValue, 1, m.name, m.username, m.uid, m.jobid)
 		}
-		ch <- prometheus.MustNewConstMetric(e.processCount, prometheus.GaugeValue, m.processCount, m.name, m.jobid)
 		if *collectProc {
 			for exec, count := range m.processExec {
 				ch <- prometheus.MustNewConstMetric(e.processExec, prometheus.GaugeValue, count, m.name, exec, m.jobid)
 			}
+		}
+	}
+}
+
+func getUsername(uid int, logger log.Logger) (string, error) {
+	userInfo, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		level.Error(logger).Log("msg", "Unable to lookup user", "uid", uid, "err", err)
+		return "", err
+	}
+	return userInfo.Username, nil
+}
+
+func getProcStats(pids []int, metric *CgroupMetric, logger log.Logger) {
+	metric.processCount = float64(len(pids))
+	metric.threadCount = 0
+	metric.ioRead = 0
+	metric.ioWrite = 0
+
+	procFS, err := procfs.NewFS(*ProcRoot)
+	if err != nil {
+		level.Error(logger).Log("msg", "Unable to open procfs", "path", *ProcRoot, "err", err)
+		return
+	}
+	for _, pid := range pids {
+		proc, err := procFS.Proc(pid)
+		if err != nil {
+			level.Error(logger).Log("msg", "Unable to read PID", "pid", pid, "err", err)
+			return
+		}
+		stat, err := proc.Stat()
+		if err != nil {
+			level.Error(logger).Log("msg", "Unable to stat PID", "pid", pid, "err", err)
+		} else {
+			metric.threadCount += float64(stat.NumThreads)
+		}
+		status, err := proc.NewStatus()
+		if err != nil {
+			level.Error(logger).Log("msg", "Unable to get PID status", "pid", pid, "err", err)
+		} else {
+			if metric.uid == "" || metric.uid == "0" {
+				uid := int(status.UIDs[0])
+				username, _ := getUsername(uid, logger)
+				metric.uid = strconv.Itoa(uid)
+				metric.username = username
+			}
+		}
+		ioStats, err := proc.IO()
+		if err != nil {
+			// requires: `setcap 'cap_sys_ptrace=ep cap_dac_read_search=ep' $0`
+			level.Debug(logger).Log("msg", "Unable to get PID IO", "pid", pid, "err", err)
+		} else {
+			metric.ioRead += float64(ioStats.ReadBytes)
+			metric.ioWrite += float64(ioStats.WriteBytes)
 		}
 	}
 }
